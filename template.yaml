@@ -2,26 +2,54 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: Yellow Card Backend Test - Transaction Service (SAM + LocalStack)
 
+Parameters:
+  ApiKeyValue:
+    Type: String
+    Default: "local-dev-api-key-change-in-prod"
+    Description: >
+      API key required on every protected request (x-api-key header).
+      In production, supply this via AWS Systems Manager Parameter Store.
+
 Globals:
   Function:
     Runtime: nodejs20.x
-    Timeout: 10
+    Timeout: 30
     MemorySize: 256
     Environment:
       Variables:
-        TABLE_NAME: !Ref TransactionsTable
+        TABLE_NAME:        !Ref TransactionsTable
+        AUDIT_TABLE_NAME:  !Ref TransactionAuditTable
+        QUEUE_URL:         !Ref TransactionQueue
+        API_KEY:           !Ref ApiKeyValue
+        LOG_LEVEL:         "INFO"
         AWS_NODEJS_CONNECTION_REUSE_ENABLED: "1"
 
 Resources:
+
+  # ─── API Gateway ─────────────────────────────────────────────────────────────
+
   Api:
     Type: AWS::Serverless::Api
     Properties:
       StageName: local
       EndpointConfiguration: REGIONAL
+      Auth:
+        ApiKeyRequired: true            # All routes require x-api-key by default
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          Description: Default usage plan with API key enforcement
+          Quota:
+            Limit: 10000
+            Period: DAY
+          Throttle:
+            BurstLimit: 200
+            RateLimit: 100
       Cors:
         AllowMethods: "'GET,POST,OPTIONS'"
-        AllowHeaders: "'Content-Type'"
+        AllowHeaders: "'Content-Type,X-Idempotency-Key,X-Api-Key'"
         AllowOrigin: "'*'"
+
+  # ─── DynamoDB ─────────────────────────────────────────────────────────────────
 
   TransactionsTable:
     Type: AWS::DynamoDB::Table
@@ -34,7 +62,48 @@ Resources:
       KeySchema:
         - AttributeName: id
           KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
 
+  # Immutable audit trail – partition by transaction, sort by audit event time
+  TransactionAuditTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: transaction-audit
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: transactionId
+          AttributeType: S
+        - AttributeName: auditId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: transactionId
+          KeyType: HASH
+        - AttributeName: auditId
+          KeyType: RANGE
+      # Retain audit records independently of the main table
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ─── SQS ─────────────────────────────────────────────────────────────────────
+
+  TransactionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: transaction-dlq
+      MessageRetentionPeriod: 1209600   # 14 days
+
+  TransactionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: transaction-queue
+      VisibilityTimeout: 120            # 4× Lambda timeout
+      MessageRetentionPeriod: 86400     # 1 day
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TransactionDLQ.Arn
+        maxReceiveCount: 3
+
+  # ─── Lambda functions ─────────────────────────────────────────────────────────
 
   HealthCheckFunction:
     Type: AWS::Serverless::Function
@@ -55,9 +124,103 @@ Resources:
             RestApiId: !Ref Api
             Path: /health
             Method: GET
+            Auth:
+              ApiKeyRequired: false     # Health check is publicly accessible
 
+  CreateTransactionFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - src/createTransaction.ts
+    Properties:
+      Handler: createTransaction.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TransactionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TransactionAuditTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt TransactionQueue.QueueName
+      Events:
+        CreateTx:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /transactions
+            Method: POST
+            Auth:
+              ApiKeyRequired: true
+
+  GetTransactionFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - src/getTransaction.ts
+    Properties:
+      Handler: getTransaction.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TransactionsTable
+      Events:
+        GetTx:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /transactions/{id}
+            Method: GET
+            Auth:
+              ApiKeyRequired: true
+
+  ProcessTransactionFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - src/processTransaction.ts
+    Properties:
+      Handler: processTransaction.handler
+      Timeout: 30
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TransactionsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TransactionAuditTable
+        - SQSPollerPolicy:
+            QueueName: !GetAtt TransactionQueue.QueueName
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TransactionQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
 
 Outputs:
   ApiBaseUrl:
     Description: Base URL of the API Gateway endpoint
     Value: !Sub "http://localhost:4566/restapis/${Api}/local/_user_request_"
+  TransactionQueueUrl:
+    Description: SQS Queue URL for transaction processing
+    Value: !Ref TransactionQueue
+  TransactionDLQUrl:
+    Description: Dead-letter queue URL
+    Value: !Ref TransactionDLQ
+  AuditTableName:
+    Description: DynamoDB table holding the immutable transaction audit trail
+    Value: !Ref TransactionAuditTable
+
