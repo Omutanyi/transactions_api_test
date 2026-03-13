@@ -1,26 +1,27 @@
 import type { APIGatewayProxyEvent } from "aws-lambda";
-import { json } from "./shared";
+import { json, errorResponse } from "./shared.js";
+import { createLogger } from "./logger.js";
 
+const log = createLogger({ service: "healthCheck" });
 
 export async function handler(event: APIGatewayProxyEvent | any) {
-    try {
-        const path =
-            event?.path ??
-            event?.rawPath ??
-            event?.requestContext?.http?.path ??
-            "";
+  try {
+    const path: string =
+      event?.path ??
+      event?.rawPath ??
+      event?.requestContext?.http?.path ??
+      "";
 
-        const resource = event?.resource ?? "";
+    const resource: string = event?.resource ?? "";
 
-        console.log(resource);
-
-
-        if (path.endsWith("/health") || resource === "/health") {
-            return json(200, { ok: true });
-        }
-
-    } catch (err: any) {
-        console.error("Health check error", err);
-        return json(500, { error: "InternalError" });
+    if (path.endsWith("/health") || resource === "/health" || path === "") {
+      log.debug("HealthCheckOk");
+      return json(200, { ok: true, timestamp: new Date().toISOString() });
     }
+
+    return json(404, { error: "NotFound", message: "Route not found." });
+  } catch (err: unknown) {
+    log.error("HealthCheckError", {}, err);
+    return errorResponse(err);
+  }
 }

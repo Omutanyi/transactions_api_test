@@ -1,6 +1,9 @@
 import { UpdateCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 import type { SQSEvent, SQSRecord } from "aws-lambda";
-import { ddbDoc, TABLE_NAME, type TransactionStatus } from "./shared";
+import { ddbDoc, TABLE_NAME, writeAuditEntry, type TransactionStatus } from "./shared.js";
+import { createLogger } from "./logger.js";
+
+const log = createLogger({ service: "processTransaction" });
 
 // ─── Simulated processing logic ──────────────────────────────────────────────
 
@@ -12,7 +15,7 @@ import { ddbDoc, TABLE_NAME, type TransactionStatus } from "./shared";
  * In a production system this would call a real payment gateway.
  */
 async function runProcessing(
-  txId: string
+  txId: string,
 ): Promise<{ status: "COMPLETED" | "FAILED"; failureReason?: string }> {
   // Simulate I/O latency (≤ 200 ms so the Lambda stays well within timeout)
   await new Promise((r) => setTimeout(r, 100));
@@ -29,7 +32,7 @@ async function transitionStatus(
   id: string,
   from: TransactionStatus,
   to: TransactionStatus,
-  extra: Record<string, unknown> = {}
+  extra: Record<string, unknown> = {},
 ): Promise<void> {
   const now = new Date().toISOString();
   const extraKeys = Object.keys(extra);
@@ -48,7 +51,7 @@ async function transitionStatus(
   for (const k of extraKeys) {
     const nameKey  = `#${k}`;
     const valueKey = `:${k}`;
-    ExpressionAttributeNames[nameKey]  = k;
+    ExpressionAttributeNames[nameKey]   = k;
     ExpressionAttributeValues[valueKey] = extra[k];
     setExpr += `, ${nameKey} = ${valueKey}`;
   }
@@ -61,7 +64,7 @@ async function transitionStatus(
       ConditionExpression:       "#s = :from",
       ExpressionAttributeNames,
       ExpressionAttributeValues,
-    })
+    }),
   );
 }
 
@@ -74,31 +77,46 @@ async function processRecord(record: SQSRecord): Promise<void> {
     const payload = JSON.parse(record.body) as { transactionId: string };
     transactionId = payload.transactionId;
   } catch {
-    console.error("processTransaction: malformed SQS message body", record.body);
+    log.error("Malformed SQS message body, skipping", { messageId: record.messageId, body: record.body });
     // Do not throw – message is unprocessable, skip it (no DLQ retry needed)
     return;
   }
 
-  console.log("processTransaction: starting", transactionId);
+  const txLog = log.child({ transactionId, messageId: record.messageId });
+  txLog.info("ProcessingStarted");
 
   // Guard: only process PENDING transactions (idempotency)
-  const existing = await ddbDoc.send(new GetCommand({ TableName: TABLE_NAME, Key: { id: transactionId } }));
+  const existing = await ddbDoc.send(
+    new GetCommand({ TableName: TABLE_NAME, Key: { id: transactionId } }),
+  );
   if (!existing.Item) {
-    console.warn("processTransaction: transaction not found, skipping", transactionId);
+    txLog.warn("TransactionNotFound, skipping");
     return;
   }
   if (existing.Item.status !== "PENDING") {
-    console.warn("processTransaction: transaction already processed, skipping", transactionId, existing.Item.status);
+    txLog.warn("TransactionAlreadyProcessed, skipping", { currentStatus: existing.Item.status });
     return;
   }
 
   // PENDING → PROCESSING
   try {
     await transitionStatus(transactionId, "PENDING", "PROCESSING");
+    txLog.info("StatusTransitioned", { from: "PENDING", to: "PROCESSING" });
+
+    try {
+      await writeAuditEntry({
+        transactionId,
+        action:   "TRANSACTION_PROCESSING_STARTED",
+        snapshot: { status: "PROCESSING" },
+        actor:    `sqs:${record.messageId}`,
+      });
+    } catch (err) {
+      txLog.error("Audit write failed on PROCESSING_STARTED", {}, err);
+    }
   } catch (err: any) {
     if (err.name === "ConditionalCheckFailedException") {
       // Another invocation already picked this up
-      console.warn("processTransaction: concurrency race on PENDING→PROCESSING, skipping", transactionId);
+      txLog.warn("ConcurrencyRace on PENDING→PROCESSING, skipping");
       return;
     }
     throw err;
@@ -108,10 +126,12 @@ async function processRecord(record: SQSRecord): Promise<void> {
   let outcome: { status: "COMPLETED" | "FAILED"; failureReason?: string };
   try {
     outcome = await runProcessing(transactionId);
-  } catch (err: any) {
-    console.error("processTransaction: processing step threw, marking FAILED", transactionId, err);
+  } catch (err: unknown) {
+    txLog.error("ProcessingStepThrew, marking FAILED", {}, err);
     outcome = { status: "FAILED", failureReason: "Unexpected processing error." };
   }
+
+  txLog.info("ProcessingOutcome", { outcome: outcome.status, failureReason: outcome.failureReason });
 
   // PROCESSING → COMPLETED / FAILED
   const extra: Record<string, unknown> = {};
@@ -119,20 +139,38 @@ async function processRecord(record: SQSRecord): Promise<void> {
 
   try {
     await transitionStatus(transactionId, "PROCESSING", outcome.status, extra);
+    txLog.info("StatusTransitioned", { from: "PROCESSING", to: outcome.status });
+
+    const auditAction = outcome.status === "COMPLETED"
+      ? "TRANSACTION_COMPLETED" as const
+      : "TRANSACTION_FAILED" as const;
+
+    try {
+      await writeAuditEntry({
+        transactionId,
+        action:   auditAction,
+        snapshot: { status: outcome.status, failureReason: outcome.failureReason },
+        actor:    `sqs:${record.messageId}`,
+      });
+    } catch (err) {
+      txLog.error("Audit write failed on final status", { auditAction }, err);
+    }
   } catch (err: any) {
     if (err.name === "ConditionalCheckFailedException") {
-      console.warn("processTransaction: concurrency race on PROCESSING→final, skipping", transactionId);
+      txLog.warn("ConcurrencyRace on PROCESSING→final, skipping");
       return;
     }
     throw err;
   }
 
-  console.log("processTransaction: finished", transactionId, outcome.status);
+  txLog.info("ProcessingFinished", { finalStatus: outcome.status });
 }
 
 // ─── Lambda handler ───────────────────────────────────────────────────────────
 
-export async function handler(event: SQSEvent): Promise<{ batchItemFailures: { itemIdentifier: string }[] }> {
+export async function handler(
+  event: SQSEvent,
+): Promise<{ batchItemFailures: { itemIdentifier: string }[] }> {
   const failures: { itemIdentifier: string }[] = [];
 
   await Promise.allSettled(
@@ -140,11 +178,11 @@ export async function handler(event: SQSEvent): Promise<{ batchItemFailures: { i
       try {
         await processRecord(record);
       } catch (err) {
-        console.error("processTransaction: unhandled error for message", record.messageId, err);
+        log.error("UnhandledError for SQS message", { messageId: record.messageId }, err);
         // Report partial batch failure so SQS retries only this message
         failures.push({ itemIdentifier: record.messageId });
       }
-    })
+    }),
   );
 
   return { batchItemFailures: failures };

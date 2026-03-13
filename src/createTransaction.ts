@@ -1,75 +1,119 @@
 import { PutCommand } from "@aws-sdk/lib-dynamodb";
 import { SendMessageCommand } from "@aws-sdk/client-sqs";
 import { v4 as uuidv4 } from "uuid";
+import { z } from "zod";
 import type { APIGatewayProxyEventV2 } from "aws-lambda";
-import { ddbDoc, sqsClient, TABLE_NAME, QUEUE_URL, json, type Transaction } from "./shared";
+import {
+  ddbDoc, sqsClient, TABLE_NAME,
+  json, errorResponse, requireApiKey, writeAuditEntry,
+  type Transaction,
+} from "./shared.js";
+import { createLogger } from "./logger.js";
+import { InvalidJSONError, ValidationError } from "./errors.js";
 
-// ─── Validation ───────────────────────────────────────────────────────────────
+// ─── Zod schema ───────────────────────────────────────────────────────────────
 
-interface CreateTransactionBody {
-  amount: number;
-  currency: string;
-  reference: string;
-  [key: string]: unknown;
-}
+const CreateTransactionSchema = z.object({
+  amount: z
+    .number({ required_error: "amount is required", invalid_type_error: "amount must be a number" })
+    .positive("amount must be a positive number"),
+  currency: z
+    .string({ required_error: "currency is required" })
+    .regex(/^[A-Z]{3}$/, "currency must be a 3-letter ISO 4217 code (e.g. USD)"),
+  reference: z
+    .string({ required_error: "reference is required" })
+    .trim()
+    .min(1, "reference must not be empty"),
+  metadata: z.record(z.unknown()).optional(),
+});
 
-function validate(body: Record<string, unknown>): body is CreateTransactionBody {
-  if (typeof body.amount !== "number" || body.amount <= 0) return false;
-  if (typeof body.currency !== "string" || !/^[A-Z]{3}$/.test(body.currency)) return false;
-  if (typeof body.reference !== "string" || body.reference.trim() === "") return false;
-  return true;
-}
+type CreateTransactionBody = z.infer<typeof CreateTransactionSchema>;
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
-export async function handler(event: APIGatewayProxyEventV2) {
+export async function handler(event: APIGatewayProxyEventV2 | any) {
+  const requestId: string =
+    (event as any)?.requestContext?.requestId ??
+    (event as any)?.requestContext?.http?.requestId ??
+    uuidv4();
+
+  const log = createLogger({ service: "createTransaction", requestId });
+
   try {
-    let body: Record<string, unknown>;
+    // ── 1. API-key guard ──────────────────────────────────────────────────────
+    requireApiKey(event);
+
+    // ── 2. Parse body ─────────────────────────────────────────────────────────
+    let raw: unknown;
     try {
-      body = event.body ? JSON.parse(event.body) : {};
+      raw = event.body ? JSON.parse(event.body) : {};
     } catch {
-      return json(400, { error: "InvalidJSON", message: "Request body is not valid JSON." });
+      throw new InvalidJSONError();
     }
 
-    if (!validate(body)) {
-      return json(400, {
-        error: "ValidationError",
-        message: "Required fields: amount (positive number), currency (3-letter ISO), reference (non-empty string).",
-      });
+    // ── 3. Zod validation ─────────────────────────────────────────────────────
+    const parsed = CreateTransactionSchema.safeParse(raw);
+    if (!parsed.success) {
+      const details = parsed.error.errors.map((e) => ({
+        field:   e.path.join("."),
+        message: e.message,
+      }));
+      throw new ValidationError(
+        "Request body failed validation.",
+        details,
+      );
     }
 
+    const body: CreateTransactionBody = parsed.data;
+
+    // ── 4. Build & persist transaction ────────────────────────────────────────
     const now = new Date().toISOString();
-
     const tx: Transaction = {
       id:        uuidv4(),
       amount:    body.amount,
       currency:  body.currency,
-      reference: body.reference.trim(),
+      reference: body.reference,
       status:    "PENDING",
       createdAt: now,
       updatedAt: now,
     };
 
-    // Persist with PENDING status; fail-safe against duplicate IDs
     await ddbDoc.send(new PutCommand({
-      TableName: TABLE_NAME,
-      Item: tx,
+      TableName:           TABLE_NAME,
+      Item:                tx,
       ConditionExpression: "attribute_not_exists(id)",
     }));
 
-    // Enqueue for async processing (fire-and-forget from the API perspective)
-    if (QUEUE_URL) {
+    log.info("TransactionCreated", {
+      transactionId: tx.id,
+      amount:        tx.amount,
+      currency:      tx.currency,
+      reference:     tx.reference,
+    });
+
+    // ── 5. Audit ──────────────────────────────────────────────────────────────
+    await writeAuditEntry({
+      transactionId: tx.id,
+      action:        "TRANSACTION_CREATED",
+      snapshot:      { status: tx.status, amount: tx.amount, currency: tx.currency, reference: tx.reference },
+      actor:         `api:${requestId}`,
+    }).catch((err) => log.error("Audit write failed on TRANSACTION_CREATED", { transactionId: tx.id }, err));
+
+    // ── 6. Enqueue for async processing ───────────────────────────────────────
+    const queueUrl = process.env.QUEUE_URL ?? "";
+    if (queueUrl) {
       await sqsClient.send(new SendMessageCommand({
-        QueueUrl:    QUEUE_URL,
+        QueueUrl:    queueUrl,
         MessageBody: JSON.stringify({ transactionId: tx.id }),
       }));
+      log.debug("TransactionEnqueued", { transactionId: tx.id });
     }
 
-    console.log("TransactionCreated", JSON.stringify({ id: tx.id, reference: tx.reference }));
-
     return json(201, tx);
-  } catch (err: any) {
-    console.error("createTransaction error", err);
-    return json(500, { error: "InternalError", message: "An unexpected error occurred." });
+  } catch (err: unknown) {
+    if (err instanceof Error && !("statusCode" in err)) {
+      log.error("Unhandled error in createTransaction", {}, err);
+    }
+    return errorResponse(err);
   }
 }
