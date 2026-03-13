@@ -2,7 +2,7 @@ services:
   localstack:
     image: localstack/localstack:3
     environment:
-      - SERVICES=cloudformation,apigateway,lambda,dynamodb,s3,iam,logs,sts
+      - SERVICES=cloudformation,apigateway,lambda,dynamodb,s3,iam,logs,sts,sqs
       - DEBUG=0
       - AWS_DEFAULT_REGION=us-east-1
     ports:
@@ -24,8 +24,8 @@ services:
       - SAM_CLI_TELEMETRY=0
     depends_on:
       - localstack
-    entrypoint: ["sh","-lc"]
-    command: ["./scripts/deploy.sh"]
+    entrypoint: ["/bin/bash","-lc"]
+    command: ["sed -i 's/\r//' ./scripts/deploy.sh && bash ./scripts/deploy.sh"]
 
 volumes:
   localstack_data:
