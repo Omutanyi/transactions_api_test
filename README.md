@@ -147,7 +147,7 @@ Each status transition is:
 
 All protected endpoints require:
 ```
-x-api-key: local-dev-api-key-change-in-prod
+x-api-key: Mf7SLwQH7fEhEfdPXb0FehIo
 ```
 
 ---
@@ -174,7 +174,7 @@ Creates a new transaction and enqueues it for background processing.
 ```bash
 curl -X POST "$API_BASE/transactions" \
   -H "Content-Type: application/json" \
-  -H "x-api-key: local-dev-api-key-change-in-prod" \
+  -H "x-api-key: Mf7SLwQH7fEhEfdPXb0FehIo" \
   -d '{"amount": 100, "currency": "USD", "reference": "INV-001"}'
 ```
 
@@ -208,7 +208,7 @@ Retrieves the current state of a transaction (reflects live DynamoDB status).
 
 ```bash
 curl "$API_BASE/transactions/550e8400-e29b-41d4-a716-446655440000" \
-  -H "x-api-key: local-dev-api-key-change-in-prod"
+  -H "x-api-key: Mf7SLwQH7fEhEfdPXb0FehIo"
 ```
 
 **Response `200`**
@@ -312,12 +312,12 @@ curl "$API_BASE/health"
 # Create a transaction
 curl -X POST "$API_BASE/transactions" \
   -H "Content-Type: application/json" \
-  -H "x-api-key: local-dev-api-key-change-in-prod" \
+  -H "x-api-key: Mf7SLwQH7fEhEfdPXb0FehIo" \
   -d '{"amount": 250, "currency": "NGN", "reference": "YC-2026-001"}'
 
 # Poll transaction status (replace <id> with the returned id)
 curl "$API_BASE/transactions/<id>" \
-  -H "x-api-key: local-dev-api-key-change-in-prod"
+  -H "x-api-key: Mf7SLwQH7fEhEfdPXb0FehIo"
 ```
 
 ---

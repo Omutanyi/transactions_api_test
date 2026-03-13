@@ -5,6 +5,9 @@ services:
       - SERVICES=cloudformation,apigateway,lambda,dynamodb,s3,iam,logs,sts,sqs
       - DEBUG=0
       - AWS_DEFAULT_REGION=us-east-1
+      - ENFORCE_IAM=0
+      - DISABLE_CORS_CHECKS=1
+      - DISABLE_CUSTOM_CORS_APIGATEWAY=0
     ports:
       - "4566:4566"
     volumes:
